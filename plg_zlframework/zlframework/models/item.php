@@ -13,6 +13,7 @@ class ZLModelItem extends ZLModel
 {
 	protected $join_cats = false;
 	protected $join_tags = false;
+	protected $join_items = array();
 
 	/**
 	 * Magic method to set states by calling a method named as the filter
@@ -340,7 +341,7 @@ class ZLModelItem extends ZLModel
 		// create a nested array with all app/type/elements filtering data
 		$filters = array();
 		foreach($apps as $app) {
-			
+
 			$filters[$app->id] = array();
 			foreach ($app->getTypes() as $type) {
 
@@ -540,42 +541,103 @@ class ZLModelItem extends ZLModel
 		$is_select  = $element->get('is_select', false);
 		$is_date    = $element->get('is_date', false);
 		$is_range   = in_array($type, array('range', 'rangeequal', 'from', 'to', 'fromequal', 'toequal', 'outofrange', 'outofrangeequal'));
+		$is_related = $element->get('is_related', false);
 
-		// Multiple choice!
-		if( is_array( $value ) && !$from && !$to) {
-			$wheres[$logic][] = $this->getElementMultipleSearch($id, $value, $mode, $k, $is_select);
+		// Related Items!
+		if ($is_related) {
+			$related_element  = $element->get('related_id');
+			$wheres[$logic][] = $this->getElementRelatedSearch($element, $id, $related_element);
 		} else {
-			// Search ranges!
-			if ($is_range && !$is_date){
+			// Multiple choice!
+			if( is_array( $value ) && !$from && !$to) {
+				$wheres[$logic][] = $this->getElementMultipleSearch($id, $value, $mode, $k, $is_select);
+			} else {
+				// Search ranges!
+				if ($is_range && !$is_date){
 
-				// proceede only if values provided
-				if ($from || $to) {
+					// proceede only if values provided
+					if ($from || $to) {
 
-					// Handle everything in a special method
-					$wheres[$logic][] = $this->getElementRangeSearch($id, $from, $to, $type, $convert, $k);
-				}
+						// Handle everything in a special method
+						$wheres[$logic][] = $this->getElementRangeSearch($id, $from, $to, $type, $convert, $k);
+					}
 
-			} else  {
-				// Special date case
-				if ($is_date) {
-					$sql_value = "b$k.value";
-					$value_from = !empty($from) ? $from : '';
-					$value_to = !empty($to) ? $to : '';
-					$search_type = $type;
-					$period_mode = $element->get('period_mode', 'static');
-					$interval = $element->get('interval', 0);
-					$interval_unit = $element->get('interval_unit', '');
-					$wrapper = "(b$k.element_id = '$id' AND {query})";
+				} else  {
+					// Special date case
+					if ($is_date) {
+						$sql_value = "b$k.value";
+						$value_from = !empty($from) ? $from : '';
+						$value_to = !empty($to) ? $to : '';
+						$search_type = $type;
+						$period_mode = $element->get('period_mode', 'static');
+						$interval = $element->get('interval', 0);
+						$interval_unit = $element->get('interval_unit', '');
+						$wrapper = "(b$k.element_id = '$id' AND {query})";
 
-					$wheres[$logic][] = $this->getDateSearch(compact('sql_value', 'value', 'value_from', 'value_to', 'search_type', 'period_mode', 'interval', 'interval_unit', 'wrapper'));
-				} else {
-					// Normal search
-					$value = $this->getQuotedValue($element);
-					$wheres[$logic][] = "(b$k.element_id = '" . $id . "' AND TRIM(b$k.value) LIKE " . $value .') ';     
+						$wheres[$logic][] = $this->getDateSearch(compact('sql_value', 'value', 'value_from', 'value_to', 'search_type', 'period_mode', 'interval', 'interval_unit', 'wrapper'));
+					} else {
+
+						// Normal search
+						$value = $this->getQuotedValue($element);
+						$wheres[$logic][] = "(b$k.element_id = '" . $id . "' AND TRIM(b$k.value) LIKE " . $value .') ';     
+					}
 				}
 			}
+			$k++;
 		}
-		$k++;
+	}
+
+	/**
+	 * Get the related items search sql
+	 */
+	protected function getElementRelatedSearch($element, $identifier, $related_element)
+	{
+		$i = count($this->join_items);
+
+		// init vars
+		$date = JFactory::getDate();
+		$now  = $this->_db->Quote($date->toSql());
+		$null = $this->_db->Quote($this->_db->getNullDate());
+		
+		// Join with the needed tables
+		$this->join_items[] = "#__zoo_relateditemsproxref AS x$i ON x$i.item_id = a.id";
+		$this->join_items[] = ZOO_TABLE_ITEM . " AS r$i ON r$i.id = x$i.ritem_id";
+		
+		$wheres[] = "x$i.element_id = ". $this->_db->Quote($identifier);
+		$wheres[] = "r$i.state = 1";
+		$wheres[] = "r$i.searchable = 1";
+
+		// accessible
+		$user = $this->_db->escape( $this->getState('user'));
+		if ($user) {
+			$user = $this->app->user->get($user);
+		}
+		$wheres[] = "r$i." . $this->app->user->getDBAccessString($user ? $user : null);
+
+		// default publication up
+		$where = array();
+		$where[] = "r$i.publish_up = ".$null;
+		$where[] = "r$i.publish_up <= ".$now;
+		$where = '('.implode(' OR ', $where).')';
+		$where2 = array();
+		$where2[] = "r$i.publish_down = ".$null;
+		$where2[] = "r$i.publish_down >= ".$now;
+		$where2 = '('.implode(' OR ', $where2).')';
+		
+		$wheres[] = '(('.$where.') AND ('.$where2.'))';
+
+		switch ($related_element) {
+			case 'name':
+				$wheres[] = "(r$i.name LIKE " . $this->getQuotedValue($element) . ')';
+				break;
+			case 'id':
+				$id = (array) $element->get('value', array());
+				$wheres[] = "(r$i.id IN (" . implode(",", $id). '))';
+				break;
+		}
+
+		$wheres = '(' . implode(" AND ", $wheres) . ')';
+		return $wheres;
 	}
 
 	/**
@@ -857,6 +919,10 @@ class ZLModelItem extends ZLModel
 		// 1 join for each parameter
 		for ( $i = 0; $i < $k; $i++ ){
 			$query->leftJoin(ZOO_TABLE_SEARCH . " AS b$i ON a.id = b$i.item_id");
+		}
+
+		foreach ($this->join_items as $join) {
+			$query->leftJoin($join);
 		}
 	}
 	
