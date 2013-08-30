@@ -14,6 +14,7 @@ class ZLModelItem extends ZLModel
 	protected $join_cats = false;
 	protected $join_tags = false;
 	protected $join_items = array();
+	protected $join_related_search = array();
 
 	/**
 	 * Magic method to set states by calling a method named as the filter
@@ -517,13 +518,13 @@ class ZLModelItem extends ZLModel
 		}
 		
 		// Add repeatable joins
-		$this->addRepeatableJoins($query, $k);
+		$this->addRepeatableJoins($query, $k, 'b');
 	}
 
 	/**
 	 * Get the individual element search
 	 */
-	protected function getElementSearch($element, &$k, &$wheres)
+	protected function getElementSearch($element, &$k, &$wheres, $prefix = 'b')
 	{
 		// abort if no value is set
 		if (!$element->get('value')) return;
@@ -546,11 +547,11 @@ class ZLModelItem extends ZLModel
 		// Related Items!
 		if ($is_related) {
 			$related_element  = $element->get('related_id');
-			$wheres[$logic][] = $this->getElementRelatedSearch($element, $id, $related_element);
+			$wheres[$logic][] = $this->getElementRelatedSearch($element, $id, $related_element, $k);
 		} else {
 			// Multiple choice!
 			if( is_array( $value ) && !$from && !$to) {
-				$wheres[$logic][] = $this->getElementMultipleSearch($id, $value, $mode, $k, $is_select);
+				$wheres[$logic][] = $this->getElementMultipleSearch($id, $value, $mode, $k, $is_select, $prefix);
 			} else {
 				// Search ranges!
 				if ($is_range && !$is_date){
@@ -559,27 +560,27 @@ class ZLModelItem extends ZLModel
 					if ($from || $to) {
 
 						// Handle everything in a special method
-						$wheres[$logic][] = $this->getElementRangeSearch($id, $from, $to, $type, $convert, $k);
+						$wheres[$logic][] = $this->getElementRangeSearch($id, $from, $to, $type, $convert, $k, $prefix);
 					}
 
 				} else  {
 					// Special date case
 					if ($is_date) {
-						$sql_value = "b$k.value";
+						$sql_value = "$prefix$k.value";
 						$value_from = !empty($from) ? $from : '';
 						$value_to = !empty($to) ? $to : '';
 						$search_type = $type;
 						$period_mode = $element->get('period_mode', 'static');
 						$interval = $element->get('interval', 0);
 						$interval_unit = $element->get('interval_unit', '');
-						$wrapper = "(b$k.element_id = '$id' AND {query})";
+						$wrapper = "($prefix$k.element_id = '$id' AND {query})";
 
 						$wheres[$logic][] = $this->getDateSearch(compact('sql_value', 'value', 'value_from', 'value_to', 'search_type', 'period_mode', 'interval', 'interval_unit', 'wrapper'));
 					} else {
 
 						// Normal search
 						$value = $this->getQuotedValue($element);
-						$wheres[$logic][] = "(b$k.element_id = '" . $id . "' AND TRIM(b$k.value) LIKE " . $value .') ';     
+						$wheres[$logic][] = "($prefix$k.element_id = '" . $id . "' AND TRIM($prefix$k.value) LIKE " . $value .') ';     
 					}
 				}
 			}
@@ -592,7 +593,10 @@ class ZLModelItem extends ZLModel
 	 */
 	protected function getElementRelatedSearch($element, $identifier, $related_element)
 	{
-		$i = count($this->join_items);
+		// Number of already related #__zoo_relateditemsproxref
+		$i = (int) count($this->join_items) / 2;
+		// Number of already related #__zoo_searches for the related items
+		$k = count($this->join_related_search);
 
 		// init vars
 		$date = JFactory::getDate();
@@ -603,18 +607,19 @@ class ZLModelItem extends ZLModel
 		$this->join_items[] = "#__zoo_relateditemsproxref AS x$i ON x$i.item_id = a.id";
 		$this->join_items[] = ZOO_TABLE_ITEM . " AS r$i ON r$i.id = x$i.ritem_id";
 		
+		// Basic filters for the related item (searchable and enabled)
 		$wheres[] = "x$i.element_id = ". $this->_db->Quote($identifier);
 		$wheres[] = "r$i.state = 1";
 		$wheres[] = "r$i.searchable = 1";
 
-		// accessible
+		// related item needs to be accessible
 		$user = $this->_db->escape( $this->getState('user'));
 		if ($user) {
 			$user = $this->app->user->get($user);
 		}
 		$wheres[] = "r$i." . $this->app->user->getDBAccessString($user ? $user : null);
 
-		// default publication up
+		// default publication up for related item
 		$where = array();
 		$where[] = "r$i.publish_up = ".$null;
 		$where[] = "r$i.publish_up <= ".$now;
@@ -626,13 +631,34 @@ class ZLModelItem extends ZLModel
 		
 		$wheres[] = '(('.$where.') AND ('.$where2.'))';
 
+		// Depends on the type of the related item
 		switch ($related_element) {
+			// Core searches
 			case 'name':
-				$wheres[] = "(r$i.name LIKE " . $this->getQuotedValue($element) . ')';
+				$wheres[] = "(r$k.name LIKE " . $this->getQuotedValue($element) . ')';
 				break;
 			case 'id':
 				$id = (array) $element->get('value', array());
-				$wheres[] = "(r$i.id IN (" . implode(",", $id). '))';
+				$wheres[] = "(r$k.id IN (" . implode(",", $id). '))';
+				break;
+			// Element searches
+			default:
+				// Join the searches with the related item
+				$this->join_related_search[] = ZOO_TABLE_SEARCH . " AS c$k ON r$i.id = c$k.item_id";
+
+				// Move the parameters passed as the parameters of the related element
+				$relement = clone $element;
+				$element->set('id', $related_element);
+				
+				// do not allow related of related, please!
+				$element->set('is_related', false);
+
+				// Workaround to reuse the already present code for element searches
+				$temp = array($element->get('logic', 'AND') => array());
+				$this->getElementSearch($element, $k, $temp, 'c');
+				$temp = $temp[$element->get('logic', 'AND')];
+				$wheres = array_merge($wheres, $temp);
+				
 				break;
 		}
 
@@ -643,7 +669,7 @@ class ZLModelItem extends ZLModel
 	/**
 	 * Get the range search sql
 	 */
-	protected function getElementRangeSearch($identifier, $from, $to, $type, $convert, $k)
+	protected function getElementRangeSearch($identifier, $from, $to, $type, $convert, $k, $prefix = 'b')
 	{	
 		// Evaluate if is equal
 		$is_equal = false;
@@ -674,22 +700,22 @@ class ZLModelItem extends ZLModel
 			case "range": 
 				if ($from) {
 					$new_type = $is_equal ? 'fromequal' : 'from';
-					$sql[] = $this->getElementRangeSearch($identifier, $from, $to, $new_type, $convert, $k);
+					$sql[] = $this->getElementRangeSearch($identifier, $from, $to, $new_type, $convert, $k, $prefix);
 				}
 				if ($to) {
 					$new_type = $is_equal ? 'toequal' : 'to';
-					$sql[] = $this->getElementRangeSearch($identifier, $from, $to, $new_type, $convert, $k);
+					$sql[] = $this->getElementRangeSearch($identifier, $from, $to, $new_type, $convert, $k, $prefix);
 				}
 				return implode(" AND ", $sql);
 				break;
 			case "outofrange":
 				if ($to) {
 					$new_type = $is_equal ? 'fromequal' : 'from';
-					$sql[] = $this->getElementRangeSearch($identifier, $to, $from, $new_type, $convert, $k);
+					$sql[] = $this->getElementRangeSearch($identifier, $to, $from, $new_type, $convert, $k, $prefix);
 				}
 				if ($from) {
 					$new_type = $is_equal ? 'toequal' : 'to';
-					$sql[] = $this->getElementRangeSearch($identifier, $to, $from, $new_type, $convert, $k);
+					$sql[] = $this->getElementRangeSearch($identifier, $to, $from, $new_type, $convert, $k, $prefix);
 				}
 				return implode(" AND ", $sql);
 				break;
@@ -701,7 +727,7 @@ class ZLModelItem extends ZLModel
 		}
 		
 		// Build range sql
-		return "(b$k.element_id = '" . $identifier . "' AND CONVERT(TRIM(b$k.value+0), $convert) " . $symbol . " " . $value.")";
+		return "($prefix$k.element_id = '" . $identifier . "' AND CONVERT(TRIM($prefix$k.value+0), $convert) " . $symbol . " " . $value.")";
 	}
 
 	/**
@@ -791,9 +817,9 @@ class ZLModelItem extends ZLModel
 	/**
 	 * Get the multiple values search sql
 	 */
-	protected function getElementMultipleSearch($identifier, $values, $mode, $k, $is_select = true)
+	protected function getElementMultipleSearch($identifier, $values, $mode, $k, $is_select = true, $prefix = 'b')
 	{
-		$el_where = "b$k.element_id = " . $this->_db->Quote($identifier);               
+		$el_where = "$prefix$k.element_id = " . $this->_db->Quote($identifier);               
 
 		// lets be sure mode is set
 		$mode = $mode ? $mode : "AND";
@@ -805,10 +831,10 @@ class ZLModelItem extends ZLModel
 		{
 			foreach($values as $value)
 			{
-				$multiple = "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value)))." OR ";
-				$multiple .= "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value)."\n%"))." OR ";
-				$multiple .= "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim("%\n".$this->_db->escape($value)))." OR ";
-				$multiple .= "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim("%\n".$this->_db->escape($value)."\n%"));
+				$multiple = "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value)))." OR ";
+				$multiple .= "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value)."\n%"))." OR ";
+				$multiple .= "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim("%\n".$this->_db->escape($value)))." OR ";
+				$multiple .= "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim("%\n".$this->_db->escape($value)."\n%"));
 				$multiples[] = "(".$multiple.")";
 			}
 		} 
@@ -817,10 +843,10 @@ class ZLModelItem extends ZLModel
 		{
 			foreach($values as $value)
 			{
-				$multiple = "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value)))." OR ";
-				$multiple .= "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value).' %'))." OR ";
-				$multiple .= "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim('% '.$this->_db->escape($value)))." OR ";
-				$multiple .= "TRIM(b$k.value) LIKE ".$this->_db->Quote(trim('% '.$this->_db->escape($value).' %'));
+				$multiple = "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value)))." OR ";
+				$multiple .= "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim($this->_db->escape($value).' %'))." OR ";
+				$multiple .= "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim('% '.$this->_db->escape($value)))." OR ";
+				$multiple .= "TRIM($prefix$k.value) LIKE ".$this->_db->Quote(trim('% '.$this->_db->escape($value).' %'));
 				$multiples[] = "(".$multiple.")";
 			}
 		}
@@ -914,14 +940,18 @@ class ZLModelItem extends ZLModel
 	/**
 	 * One Join for each element filter
 	 */
-	protected function addRepeatableJoins(&$query, $k)
+	protected function addRepeatableJoins(&$query, $k, $prefix = 'b')
 	{
 		// 1 join for each parameter
 		for ( $i = 0; $i < $k; $i++ ){
-			$query->leftJoin(ZOO_TABLE_SEARCH . " AS b$i ON a.id = b$i.item_id");
+			$query->leftJoin(ZOO_TABLE_SEARCH . " AS $prefix$i ON a.id = $prefix$i.item_id");
 		}
 
 		foreach ($this->join_items as $join) {
+			$query->leftJoin($join);
+		}
+
+		foreach ($this->join_related_search as $join) {
 			$query->leftJoin($join);
 		}
 	}
